@@ -1,0 +1,46 @@
+name: Backend CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/**'
+
+jobs:
+  test-build:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Download Dependencies
+        run: go mod download
+
+      - name: Run Tests
+        run: go test ./...
+
+      - name: Security Scan
+        uses: securego/gosec@master
+        with:
+          args: ./...
+
+      - name: Build Docker Image
+        run: docker build -t starttech-backend .
+
+      - name: Login To ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push
+        run: |
+          docker tag starttech-backend:latest ${{ secrets.ECR_REPOSITORY }}:latest
+          docker push ${{ secrets.ECR_REPOSITORY }}:latest
