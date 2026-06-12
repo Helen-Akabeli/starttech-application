@@ -65,50 +65,164 @@ jobs:
           exit-code: '0'
           severity: CRITICAL,HIGH
 
+      - name: Verify SSM Instance Readiness
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          echo "Checking for running instances..."
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=starttech-backend" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[*].Instances[*].InstanceId" \
+            --output text \
+            --region $AWS_REGION)
+
+          if [ -z "$INSTANCE_IDS" ]; then
+            echo "No running instances found — skipping deploy"
+            exit 0
+          fi
+
+          echo "Found instances: $INSTANCE_IDS"
+          FAILED_INSTANCES=""
+
+          for ID in $INSTANCE_IDS; do
+            echo "Checking SSM status for $ID..."
+            PING_STATUS=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=$ID" \
+              --query "InstanceInformationList[0].PingStatus" \
+              --output text \
+              --region $AWS_REGION 2>/dev/null || echo "NotFound")
+            
+            if [ "$PING_STATUS" != "Online" ]; then
+              echo "⚠️  WARNING: Instance $ID is not ready for SSM commands (Status: $PING_STATUS)"
+              FAILED_INSTANCES="$FAILED_INSTANCES $ID"
+            else
+              echo "✓ Instance $ID is ready for deployment"
+            fi
+          done
+
+          if [ -n "$FAILED_INSTANCES" ]; then
+            echo ""
+            echo "⚠️  The following instances are not ready for deployment:$FAILED_INSTANCES"
+            echo "Fix: Ensure these instances have:"
+            echo "  1. IAM role with AmazonSSMManagedInstanceCore policy attached"
+            echo "  2. SSM Agent running and enabled"
+            echo "  3. Network connectivity to SSM endpoints"
+            echo ""
+            echo "Continuing with other instances..."
+          fi
+
       - name: Rolling deploy via SSM
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+          REDIS_HOST: ${{ secrets.REDIS_HOST }}
         run: |
           INSTANCE_IDS=$(aws ec2 describe-instances \
             --filters "Name=tag:Name,Values=starttech-backend" \
                       "Name=instance-state-name,Values=running" \
             --query "Reservations[*].Instances[*].InstanceId" \
-            --output text)
+            --output text \
+            --region $AWS_REGION)
 
           if [ -z "$INSTANCE_IDS" ]; then
-            echo "No running instances found yet — skipping deploy"
+            echo "No running instances found — skipping deploy"
             exit 0
           fi
 
+          DEPLOY_FAILED=0
+
           for ID in $INSTANCE_IDS; do
             echo "Deploying to $ID..."
-            aws ssm send-command \
+            
+            # Check SSM readiness before attempting deployment
+            PING_STATUS=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=$ID" \
+              --query "InstanceInformationList[0].PingStatus" \
+              --output text \
+              --region $AWS_REGION 2>/dev/null || echo "NotFound")
+            
+            if [ "$PING_STATUS" != "Online" ]; then
+              echo "❌ Instance $ID is not ready (Status: $PING_STATUS). Skipping..."
+              DEPLOY_FAILED=$((DEPLOY_FAILED + 1))
+              continue
+            fi
+
+            COMMAND_ID=$(aws ssm send-command \
               --instance-ids "$ID" \
               --document-name "AWS-RunShellScript" \
+              --region $AWS_REGION \
               --parameters commands="[
                 'aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REGISTRY',
                 'docker pull $REGISTRY/starttech-backend:$IMAGE_TAG',
                 'docker stop backend || true',
                 'docker rm backend || true',
-                'docker run -d --name backend --restart always -p 8080:8080 -e MONGO_URI=${{ secrets.MONGO_URI }} -e REDIS_HOST=${{ secrets.REDIS_HOST }} -e APP_ENV=production $REGISTRY/starttech-backend:$IMAGE_TAG'
-              ]"
-            sleep 30
+                'docker run -d --name backend --restart always -p 8080:8080 -e MONGO_URI=$MONGO_URI -e REDIS_HOST=$REDIS_HOST -e APP_ENV=production $REGISTRY/starttech-backend:$IMAGE_TAG'
+              ]" \
+              --query 'Command.CommandId' \
+              --output text 2>/dev/null || echo "")
+
+            if [ -z "$COMMAND_ID" ]; then
+              echo "❌ Failed to send command to instance $ID"
+              DEPLOY_FAILED=$((DEPLOY_FAILED + 1))
+              continue
+            fi
+
+            echo "✓ Command sent to $ID (CommandId: $COMMAND_ID)"
+            
+            # Wait for command completion
+            for attempt in {1..30}; do
+              COMMAND_STATUS=$(aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$ID" \
+                --region $AWS_REGION \
+                --query 'Status' \
+                --output text 2>/dev/null || echo "")
+              
+              if [ "$COMMAND_STATUS" = "Success" ]; then
+                echo "✓ Deployment to $ID completed successfully"
+                break
+              elif [ "$COMMAND_STATUS" = "Failed" ] || [ "$COMMAND_STATUS" = "Cancelled" ]; then
+                echo "❌ Deployment to $ID failed with status: $COMMAND_STATUS"
+                DEPLOY_FAILED=$((DEPLOY_FAILED + 1))
+                break
+              fi
+              
+              if [ $attempt -eq 30 ]; then
+                echo "⚠️  Deployment to $ID timed out (still running after 150s)"
+              fi
+              
+              sleep 5
+            done
           done
 
+          if [ $DEPLOY_FAILED -gt 0 ]; then
+            echo ""
+            echo "⚠️  $DEPLOY_FAILED deployment(s) failed or were skipped"
+          fi
+
       - name: Health check
+        continue-on-error: true
+        env:
+          ALB_DNS_NAME: ${{ secrets.ALB_DNS_NAME }}
         run: |
+          if [ -z "$ALB_DNS_NAME" ]; then
+            echo "ALB_DNS_NAME secret not configured, skipping health check"
+            exit 0
+          fi
+
           echo "Waiting for backend to be healthy..."
           for i in {1..10}; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-              http://${{ secrets.ALB_DNS_NAME }}/health || echo "000")
+              "http://$ALB_DNS_NAME/health" 2>/dev/null || echo "000")
             echo "Attempt $i: HTTP $STATUS"
             if [ "$STATUS" = "200" ]; then
-              echo "Backend is healthy"
+              echo "✓ Backend is healthy"
               exit 0
             fi
             sleep 15
           done
-          echo "Health check failed"
+          echo "⚠️  Health check failed after 10 attempts"
           exit 1
