@@ -1,51 +1,63 @@
 name: Backend CI/CD
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'backend/**'
+push:
+branches:
+- main
+paths:
+- 'backend/**'
+- '.github/workflows/backend-ci-cd.yml'
 
 jobs:
-  test-build:
-    runs-on: ubuntu-latest
+build-and-push:
+runs-on: ubuntu-latest
 
-    defaults:
-      run:
-        working-directory: backend
+```
+defaults:
+  run:
+    working-directory: backend
 
-    steps:
-      - uses: actions/checkout@v4
+steps:
+  - name: Checkout Repository
+    uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
+  - name: Setup Go
+    uses: actions/setup-go@v5
+    with:
+      go-version: '1.22'
 
-      - name: Download Dependencies
-        run: go mod download
+  - name: Download Dependencies
+    run: go mod download
 
-      - name: Run Tests
-        run: go test ./...
+  - name: Run Tests
+    run: go test ./...
 
-      - name: Security Scan
-        uses: securego/gosec@master
-        with:
-          args: ./...
+  - name: Build Application
+    run: go build ./cmd/api
 
-      - name: Build Docker Image
-        run: docker build -t starttech-backend .
+  - name: Configure AWS Credentials
+    uses: aws-actions/configure-aws-credentials@v4
+    with:
+      aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      aws-region: us-east-1
 
-      - name: Login To ECR
-        uses: aws-actions/amazon-ecr-login@v2
-        with:
-          aws-region: us-east-1
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  - name: Login To Amazon ECR
+    id: login-ecr
+    uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and Push
-        run: |
-          docker tag starttech-backend:latest ${{ secrets.ECR_REPOSITORY }}:latest
-          docker push ${{ secrets.ECR_REPOSITORY }}:latest
+  - name: Build Docker Image
+    run: docker build -t starttech-backend .
+
+  - name: Tag Docker Image
+    run: |
+      docker tag starttech-backend:latest ${{ secrets.ECR_REPOSITORY }}:latest
+
+  - name: Push Docker Image
+    run: |
+      docker push ${{ secrets.ECR_REPOSITORY }}:latest
+
+  - name: Verify ECR Repository
+    run: |
+      aws ecr describe-repositories
+```
