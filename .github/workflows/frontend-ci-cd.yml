@@ -24,6 +24,10 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: Run ESLint
+        working-directory: frontend
+        run: npm run lint
+
       - name: Security audit
         working-directory: frontend
         run: npm audit --audit-level=critical
@@ -33,7 +37,7 @@ jobs:
         working-directory: frontend
         run: npm run build
         env:
-          VITE_API_URL: ${{ secrets.API_URL }}
+         VITE_API_URL: ${{ secrets.API_URL }}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
