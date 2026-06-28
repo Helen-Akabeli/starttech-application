@@ -1,9 +1,11 @@
-FROM golang:1.22 AS builder
+FROM golang:1.22-alpine AS builder
 WORKDIR /app
-COPY . .
+COPY go.mod go.sum ./
 RUN go mod download
+COPY . .
 RUN go build -o starttech ./cmd/api
-FROM ubuntu:22.04
+
+FROM alpine:3.18
 WORKDIR /app
 COPY --from=builder /app/starttech .
 EXPOSE 8080
