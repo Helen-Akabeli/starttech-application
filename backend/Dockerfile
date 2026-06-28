@@ -4,6 +4,7 @@ ENV GOTOOLCHAIN=auto
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+RUN go mod tidy
 RUN go build -o starttech ./cmd/api
 
 FROM alpine:3.18
